@@ -56,6 +56,17 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 public constant BUCKETS = 25;
     uint256 public constant REQUEST_TTL = 1 days;
 
+    bytes32 public constant REASON_EXCEEDS_PER_TX_CAP = keccak256("ExceedsPerTxCap");
+    bytes32 public constant REASON_WINDOW_CAP_EXCEEDED = keccak256("WindowCapExceeded");
+    bytes32 public constant REASON_NOT_ALLOWLISTED = keccak256("NotAllowlisted");
+    bytes32 public constant REASON_LOW_TRUST = keccak256("LowTrust");
+    bytes32 public constant REASON_POLICY_EXPIRED = keccak256("PolicyExpired");
+    bytes32 public constant REASON_NOT_AGENT = keccak256("NotAgent");
+    bytes32 public constant REASON_PAUSED = keccak256("Paused");
+    bytes32 public constant REASON_ZERO_AMOUNT = keccak256("ZeroAmount");
+    bytes32 public constant REASON_DENYLISTED = keccak256("Denylisted");
+    bytes32 public constant REASON_APPROVAL_REQUIRED = keccak256("ApprovalRequired");
+
     // ---------------------------------------------------------------- storage
     IERC20 public immutable token;
     IReputationSource public reputation;
@@ -64,6 +75,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     mapping(address => bool) public allowlist;
     mapping(address => bool) public denylist;
     mapping(address => Bucket[25]) private _buckets;
+    mapping(address => uint256) public strikes;
+    uint256 public maxStrikes = 3;
 
     uint256 public nextRequestId = 1;
     mapping(uint256 => Request) public requests;
@@ -79,6 +92,10 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     event DenylistSet(address indexed account, bool denied);
     event ReputationSourceSet(address indexed source);
     event Withdrawn(address indexed to, uint256 amount);
+    /// @notice Emitted when a payment attempt is blocked by a policy check.
+    event PaymentBlocked(address indexed agent, address indexed to, uint256 amount, bytes32 reasonCode);
+    /// @notice Emitted when an agent is automatically revoked after reaching the strike limit.
+    event AgentAutoRevoked(address indexed agent, uint256 strikes);
 
     // ----------------------------------------------------------------- errors
     error NotAgent();
@@ -119,6 +136,47 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         _spend(msg.sender, p, to, amount, ref);
     }
 
+    /// @notice Attempts a direct payment without reverting on policy violations.
+    /// @dev The caller must be the supplied agent; runtime failures such as token transfer errors still revert.
+    function tryPay(address agent, address to, uint256 amount) external nonReentrant returns (bool success) {
+        address strikeAgent = agent == msg.sender ? agent : msg.sender;
+        bytes32 reasonCode;
+        Policy memory p = policies[agent];
+
+        if (paused()) reasonCode = REASON_PAUSED;
+        else if (agent != msg.sender || !p.active) reasonCode = REASON_NOT_AGENT;
+        else if (block.timestamp >= p.expiry) reasonCode = REASON_POLICY_EXPIRED;
+        else if (amount == 0) reasonCode = REASON_ZERO_AMOUNT;
+        else if (amount > p.perTxCap) reasonCode = REASON_EXCEEDS_PER_TX_CAP;
+        else if (denylist[to]) reasonCode = REASON_DENYLISTED;
+        else if (!allowlist[to]) {
+            if (p.minTrust == 0 || address(reputation) == address(0)) {
+                reasonCode = REASON_NOT_ALLOWLISTED;
+            } else {
+                try reputation.trustScore(to) returns (uint256 score) {
+                    if (score < p.minTrust) reasonCode = REASON_LOW_TRUST;
+                } catch {
+                    reasonCode = REASON_LOW_TRUST;
+                }
+            }
+        }
+
+        if (reasonCode == bytes32(0) && amount > p.approvalThreshold) {
+            reasonCode = REASON_APPROVAL_REQUIRED;
+        }
+        if (reasonCode == bytes32(0) && windowSpent(agent) + amount > p.windowCap) {
+            reasonCode = REASON_WINDOW_CAP_EXCEEDED;
+        }
+
+        if (reasonCode != bytes32(0)) {
+            _recordBlockedPayment(strikeAgent, to, amount, reasonCode);
+            return false;
+        }
+
+        _spend(agent, p, to, amount, bytes32(0));
+        return true;
+    }
+
     // ============================================================ owner actions
 
     function approve(uint256 id) external onlyOwner whenNotPaused nonReentrant {
@@ -155,8 +213,23 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Instantly disable an agent. Pending requests from it become unexecutable.
     function revoke(address agent) external onlyOwner {
+        _revokeAgent(agent);
+    }
+
+    function _revokeAgent(address agent) internal {
         policies[agent].active = false;
         emit AgentRevoked(agent);
+    }
+
+    /// @notice Clears the recorded policy-violation strikes for an agent.
+    function resetStrikes(address agent) external onlyOwner {
+        strikes[agent] = 0;
+    }
+
+    /// @notice Sets the strike threshold for automatic agent revocation.
+    function setMaxStrikes(uint256 n) external onlyOwner {
+        require(n >= 1 && n <= 10, "MaxStrikes out of bounds");
+        maxStrikes = n;
     }
 
     function setAllowed(address account, bool allowed) external onlyOwner {
@@ -204,6 +277,10 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         if (!p.active || block.timestamp >= p.expiry) return 0;
         uint256 spent = windowSpent(agent);
         return spent >= p.windowCap ? 0 : p.windowCap - spent;
+    }
+
+    function getStrikes(address agent) external view returns (uint256) {
+        return strikes[agent];
     }
 
     /// @notice Dry-run: returns "" if `agent` could pay now, else a short reason.
@@ -263,5 +340,14 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
 
         token.safeTransfer(to, amount);
         emit Paid(agent, to, amount, ref);
+    }
+
+    function _recordBlockedPayment(address agent, address to, uint256 amount, bytes32 reasonCode) internal {
+        emit PaymentBlocked(agent, to, amount, reasonCode);
+        strikes[agent]++;
+        if (strikes[agent] >= maxStrikes && policies[agent].active) {
+            _revokeAgent(agent);
+            emit AgentAutoRevoked(agent, strikes[agent]);
+        }
     }
 }

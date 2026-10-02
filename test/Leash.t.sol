@@ -2,11 +2,15 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {Leash} from "../src/Leash.sol";
 import {ERC8004ReputationAdapter} from "../src/adapters/ERC8004ReputationAdapter.sol";
 import {MockUSDG, MockReputation, MockERC8004Registry, MockIdentity} from "./mocks/Mocks.sol";
 
 contract LeashTest is Test {
+    event PaymentBlocked(address indexed agent, address indexed to, uint256 amount, bytes32 reasonCode);
+    event AgentAutoRevoked(address indexed agent, uint256 strikes);
+
     Leash leash;
     MockUSDG usdg;
     MockReputation rep;
@@ -46,6 +50,17 @@ contract LeashTest is Test {
             approvalThreshold: uint128(approval),
             minTrust: minTrust
         });
+    }
+
+    function _expectBlocked(address caller, address attemptedAgent, address to, uint256 amount, bytes32 reasonCode)
+        internal
+        returns (bool)
+    {
+        address eventAgent = attemptedAgent == caller ? attemptedAgent : caller;
+        vm.expectEmit(true, true, false, true, address(leash));
+        emit PaymentBlocked(eventAgent, to, amount, reasonCode);
+        vm.prank(caller);
+        return leash.tryPay(attemptedAgent, to, amount);
     }
 
     // ------------------------------------------------------------ happy path
@@ -133,6 +148,139 @@ contract LeashTest is Test {
         vm.prank(agent);
         vm.expectRevert();
         leash.pay(merchant, 1 * U, "");
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_NotAllowlisted() public {
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_ExceedsPerTxCap() public {
+        assertFalse(_expectBlocked(agent, agent, merchant, 11 * U, leash.REASON_EXCEEDS_PER_TX_CAP()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_WindowCapExceeded() public {
+        vm.startPrank(agent);
+        for (uint256 i; i < 5; i++) leash.pay(merchant, 5 * U, "");
+        vm.stopPrank();
+
+        assertFalse(_expectBlocked(agent, agent, merchant, U, leash.REASON_WINDOW_CAP_EXCEEDED()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_PolicyExpired() public {
+        vm.warp(block.timestamp + 8 days);
+        assertFalse(_expectBlocked(agent, agent, merchant, U, leash.REASON_POLICY_EXPIRED()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_NotAgent() public {
+        assertFalse(_expectBlocked(attacker, attacker, merchant, U, leash.REASON_NOT_AGENT()));
+        assertEq(leash.strikes(attacker), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_Paused() public {
+        vm.prank(owner);
+        leash.pause();
+        assertFalse(_expectBlocked(agent, agent, merchant, U, leash.REASON_PAUSED()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_ZeroAmount() public {
+        assertFalse(_expectBlocked(agent, agent, merchant, 0, leash.REASON_ZERO_AMOUNT()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_Denylisted() public {
+        vm.prank(owner);
+        leash.setDenied(merchant, true);
+        assertFalse(_expectBlocked(agent, agent, merchant, U, leash.REASON_DENYLISTED()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_recordsBlockedEventWithReason_LowTrust() public {
+        vm.prank(owner);
+        leash.setPolicy(agent, _policy(10 * U, 25 * U, 5 * U, 80));
+        rep.set(stranger, 50);
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_LOW_TRUST()));
+        assertEq(leash.strikes(agent), 1);
+    }
+
+    function test_tryPay_incrementsStrikes() public {
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertEq(leash.strikes(agent), 2);
+    }
+
+    function test_tryPay_autoRevokesAfterMaxStrikes() public {
+        vm.prank(owner);
+        leash.setMaxStrikes(3);
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+
+        vm.recordLogs();
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 eventTopic = keccak256("AgentAutoRevoked(address,uint256)");
+        bool foundAutoRevoke;
+        for (uint256 i; i < entries.length; i++) {
+            if (entries[i].topics.length == 2 && entries[i].topics[0] == eventTopic) {
+                assertEq(address(uint160(uint256(entries[i].topics[1]))), agent);
+                assertEq(abi.decode(entries[i].data, (uint256)), 3);
+                foundAutoRevoke = true;
+            }
+        }
+        assertTrue(foundAutoRevoke);
+        assertEq(leash.strikes(agent), 3);
+
+        assertFalse(_expectBlocked(agent, agent, merchant, U, leash.REASON_NOT_AGENT()));
+        assertEq(leash.strikes(agent), 4);
+    }
+
+    function test_tryPay_doesNotAutoRevokeBelowMax() public {
+        vm.prank(owner);
+        leash.setMaxStrikes(3);
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+
+        vm.prank(agent);
+        assertEq(leash.pay(merchant, U, ""), 0);
+        (bool active,,,,,) = leash.policies(agent);
+        assertTrue(active);
+    }
+
+    function test_resetStrikes() public {
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        vm.prank(owner);
+        leash.resetStrikes(agent);
+        assertEq(leash.getStrikes(agent), 0);
+
+        vm.prank(agent);
+        assertEq(leash.pay(merchant, U, ""), 0);
+    }
+
+    function test_setMaxStrikes_bounds() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "MaxStrikes out of bounds"));
+        leash.setMaxStrikes(0);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "MaxStrikes out of bounds"));
+        leash.setMaxStrikes(11);
+        leash.setMaxStrikes(5);
+        vm.stopPrank();
+        assertEq(leash.maxStrikes(), 5);
+    }
+
+    function test_tryPay_successPath() public {
+        vm.recordLogs();
+        vm.prank(agent);
+        assertTrue(leash.tryPay(agent, merchant, U));
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 blockedTopic = keccak256("PaymentBlocked(address,address,uint256,bytes32)");
+        for (uint256 i; i < entries.length; i++) assertTrue(entries[i].topics[0] != blockedTopic);
+        assertEq(leash.strikes(agent), 0);
+        assertEq(usdg.balanceOf(merchant), U);
     }
 
     // ------------------------------------------------------- reputation gating

@@ -19,6 +19,7 @@ contract Handler is Test {
     uint256 public totalPaid;
     uint256 public maxWindowSeen;
     bool public capViolated;
+    bool public tryPayCapViolated;
     uint256 public cap;
 
     constructor(Leash l, MockUSDG u, address a, address o, address[] memory m, uint256 cap_) {
@@ -35,8 +36,20 @@ contract Handler is Test {
         address m = merchants[mSeed % merchants.length];
         vm.prank(agent);
         try leash.pay(m, amt, "") returns (uint256 id) {
-            if (id == 0) _record(amt);
+            if (id == 0) _record(amt, false);
         } catch {}
+    }
+
+    function tryPay(uint256 amt, uint256 mSeed) external returns (bool success) {
+        amt = bound(amt, 1, 12e6);
+        address m = merchants[mSeed % merchants.length];
+        vm.prank(agent);
+        try leash.tryPay(agent, m, amt) returns (bool paid) {
+            if (paid) _record(amt, true);
+            return paid;
+        } catch {
+            return false;
+        }
     }
 
     function approvePending(uint256 id) external {
@@ -44,7 +57,7 @@ contract Handler is Test {
         (,, uint128 amount,,,) = leash.requests(id);
         vm.prank(owner);
         try leash.approve(id) {
-            _record(amount);
+            _record(amount, false);
         } catch {}
     }
 
@@ -52,7 +65,7 @@ contract Handler is Test {
         vm.warp(block.timestamp + bound(dt, 0, 6 hours));
     }
 
-    function _record(uint256 amt) internal {
+    function _record(uint256 amt, bool fromTryPay) internal {
         times.push(block.timestamp);
         amounts.push(amt);
         totalPaid += amt;
@@ -61,7 +74,10 @@ contract Handler is Test {
             if (times[i] + 24 hours >= block.timestamp) w += amounts[i];
         }
         if (w > maxWindowSeen) maxWindowSeen = w;
-        if (w > cap) capViolated = true;
+        if (w > cap) {
+            capViolated = true;
+            if (fromTryPay) tryPayCapViolated = true;
+        }
     }
 }
 
@@ -105,6 +121,11 @@ contract LeashInvariantTest is Test {
     /// The headline guarantee: in ANY trailing 24h window, outflow <= windowCap.
     function invariant_agentNeverExceedsWindowCap() public view {
         assertFalse(handler.capViolated());
+        assertLe(handler.maxWindowSeen(), CAP);
+    }
+
+    function invariant_circuitBreakerNeverBypassesCap() public view {
+        assertFalse(handler.tryPayCapViolated());
         assertLe(handler.maxWindowSeen(), CAP);
     }
 
