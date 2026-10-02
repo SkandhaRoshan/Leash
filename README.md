@@ -1,6 +1,8 @@
 # Leash: on-chain spending policy for AI agents
 
-**Live on Arbitrum Sepolia (testnet). Deployed on Arbitrum One mainnet.** | 39 tests passing | ERC-8004 adapter verified against the live registry
+**Live on Arbitrum Sepolia (testnet, verified). Tested against the live Arbitrum One ERC-8004 registries via fork test.** | 47 unit/fuzz tests, 4 invariant properties, 6 fork tests
+
+> Give your agent a budget, not a private key.
 
 > Give your agent a budget, not a private key.
 
@@ -41,8 +43,11 @@ After deploying, curate the adapter with setTrustedClient and link using cast se
 ## Deployed Addresses
 
 ### Arbitrum Sepolia (testnet)
-- Leash: 0x... (paste after deploy)
-- ERC8004ReputationAdapter: 0x... (paste after deploy)
+- Leash: `0x15fDBe3F98560297B3001674f81646AcAd3D0683`
+- Verified: Sourcify exact match + Blockscout
+- Token (test USDC): `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`
+- Deployment tx: `0xc362a618e038d62e1c3e3d83711ebe77c8113d51f12b07bb15617491167f19a5`
+- Explorer: https://sepolia.arbiscan.io/address/0x15fDBe3F98560297B3001674f81646AcAd3D0683
 
 ### Arbitrum One (mainnet)
 - Leash: 0x... (paste after deploy)
@@ -51,14 +56,14 @@ After deploying, curate the adapter with setTrustedClient and link using cast se
 
 ## Tests
 
-**39 tests passing, 0 failures.**
+**47 unit/fuzz tests, 4 invariant properties, 6 fork tests. 0 failures.**
 
-- 32 unit/fuzz tests: every revert path, approval lifecycle, reputation gating, adapter, time-rolling fuzz
-- 3 invariants (256 runs x depth 64, 16,384 calls, 0 reverts): no 24h window exceeds the cap, vault accounting conserves funds, on-chain window view stays within cap
+- 47 unit/fuzz tests: every revert path, approval lifecycle, reputation gating, adapter, circuit breaker (tryPay), time-rolling fuzz
+- 4 invariants (256 runs x depth 64, 16,384 calls, 0 reverts): no 24h window exceeds the cap, vault accounting conserves funds, on-chain window view stays within cap, and the circuit breaker cannot bypass the rolling 24h cap
 - 6 fork tests against the live Arbitrum One ERC-8004 registry: verifies the adapter reads the real Reputation Registry at 0x8004BAa17C55a88189AE136b182e5fdA19dE9b63, links real agent IDs via the Identity Registry at 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, and confirms the live registry rejects empty reviewer lists (a bug fixed during the Buildathon)
 - Mutation check: weakening the rolling window to 24 buckets makes the fuzz test and the invariant fail
 
-Result on 2026-10-02: 6 fork tests passed, 0 failed against live Arbitrum One registries.
+Result on 2026-10-02: 47 unit/fuzz tests passed, 4 invariants passed, 6 fork tests passed, 0 failed.
 
 ## Static Analysis
 
