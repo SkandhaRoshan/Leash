@@ -1,0 +1,70 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leash dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js"></script>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--tx:#e8eaf0;--mu:#8b92a5;--ac:#5b8cff;--ok:#3ecf8e;--bad:#ff5d6c;--bd:#2a2f3a}
+@media(prefers-color-scheme:light){:root{--bg:#f5f6f8;--card:#fff;--tx:#14161b;--mu:#667085;--bd:#dde0e7}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,sans-serif;padding:16px}
+main{max-width:920px;margin:auto}h1{margin:0 0 4px}h2{font-size:15px;margin:0 0 10px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin:12px 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}input{flex:1;min-width:120px;padding:8px;border-radius:6px;border:1px solid var(--bd);background:transparent;color:var(--tx)}
+button{padding:8px 12px;border:0;border-radius:6px;background:var(--ac);color:#fff;cursor:pointer}button.d{background:var(--bad)}button.g{background:transparent;border:1px solid var(--bd);color:var(--tx)}
+.mu{color:var(--mu)}.k{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.k div{border:1px solid var(--bd);border-radius:8px;padding:8px}.k b{display:block;font-size:16px}
+#msg{position:sticky;top:8px;padding:10px;border-radius:8px;display:none;margin:8px 0}#msg.ok{display:block;background:var(--ok);color:#000}#msg.err{display:block;background:var(--bad);color:#fff}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:4px 6px;border-bottom:1px solid var(--bd);font-size:13px;word-break:break-all}
+</style></head><body><main>
+<h1>Leash</h1><div class="mu">Give your agent a budget, not a private key.</div><div id="msg"></div>
+<div class="card"><h2>1. Connect</h2><div class="row"><button id="cw">Connect wallet</button><input id="addr" placeholder="Leash contract address 0x..."><input id="fromBlock" placeholder="deploy block (for activity feed)" style="max-width:200px"><button class="g" id="load">Load</button></div><div id="info" class="mu"></div></div>
+<div class="card"><h2>2. Agent</h2><div class="row"><input id="agent" placeholder="agent session-key address 0x..."><button class="g" id="refresh">Refresh</button></div>
+<div class="k" id="stats"></div></div>
+<div class="card"><h2>3. Owner controls</h2>
+<div class="row"><input id="fund" placeholder="amount to fund"><button id="bFund">Fund vault</button><input id="wd" placeholder="amount to withdraw"><button class="g" id="bWd">Withdraw</button></div>
+<div class="row"><input id="perTx" placeholder="per-tx cap"><input id="win" placeholder="24h cap"><input id="appr" placeholder="approve above"><input id="trust" placeholder="min trust 0-100" style="max-width:130px"><input id="days" placeholder="days valid" style="max-width:110px"><button id="bPol">Set policy</button></div>
+<div class="row"><input id="cp" placeholder="counterparty address"><button class="g" id="bAllow">Allowlist</button><button class="g" id="bDeny">Denylist</button></div>
+<div class="row"><button class="d" id="bRevoke">REVOKE agent</button><button class="d" id="bPause">Pause all</button><button class="g" id="bUnpause">Unpause</button></div></div>
+<div class="card"><h2>Pending approvals</h2><table id="pend"></table></div>
+<div class="card"><h2>Activity</h2><table id="feed"></table></div>
+</main><script>
+const $=id=>document.getElementById(id),E=ethers;
+const ABI=["function owner() view returns (address)","function token() view returns (address)","function paused() view returns (bool)",
+"function policies(address) view returns (bool active,uint64 expiry,uint128 perTxCap,uint128 windowCap,uint128 approvalThreshold,uint8 minTrust)",
+"function windowSpent(address) view returns (uint256)","function remainingAllowance(address) view returns (uint256)","function nextRequestId() view returns (uint256)",
+"function requests(uint256) view returns (address agent,address to,uint128 amount,uint64 createdAt,bytes32 ref,uint8 status)",
+"function setPolicy(address,(bool active,uint64 expiry,uint128 perTxCap,uint128 windowCap,uint128 approvalThreshold,uint8 minTrust))",
+"function revoke(address)","function setAllowed(address,bool)","function setDenied(address,bool)","function pause()","function unpause()","function approve(uint256)","function reject(uint256)","function withdraw(address,uint256)",
+"event Paid(address indexed agent,address indexed to,uint256 amount,bytes32 ref)","event ApprovalRequested(uint256 indexed id,address indexed agent,address indexed to,uint256 amount,bytes32 ref)","event AgentRevoked(address indexed agent)",
+"error ExceedsPerTxCap(uint256,uint256)","error WindowCapExceeded(uint256,uint256,uint256)","error NotAllowlisted(address)","error CounterpartyDenied(address)","error TrustTooLow(uint256,uint256)","error TrustUnavailable(address)","error NotAgent()","error PolicyExpired()","error InvalidPolicy()","error ZeroAmount()","error BadRequest()","error RequestExpired()","error OwnableUnauthorizedAccount(address)","error EnforcedPause()"];
+const T20=["function balanceOf(address) view returns (uint256)","function decimals() view returns (uint8)","function symbol() view returns (string)","function transfer(address,uint256) returns (bool)"];
+let prov,signer,leash,token,dec=6,sym="USD";
+const fmt=v=>E.formatUnits(v,dec),par=v=>E.parseUnits(v||"0",dec),short=a=>a.slice(0,6)+"…"+a.slice(-4);
+function say(t,ok){const m=$("msg");m.className=ok?"ok":"err";m.textContent=t;if(ok)setTimeout(()=>m.className="",4000)}
+function why(e){try{const d=e.data||(e.info&&e.info.error&&e.info.error.data)||(e.error&&e.error.data);const p=d&&leash&&leash.interface.parseError(d);if(p)return p.name}catch(_){}return e.revert&&e.revert.name||e.shortMessage||e.message}
+async function run(label,fn){try{say(label+"…",true);const tx=await fn();if(tx&&tx.wait)await tx.wait();say(label+" ✓",true);await refresh()}catch(e){say(label+" BLOCKED: "+why(e),false)}}
+$("cw").onclick=async()=>{try{if(!window.ethereum)return say("No wallet found",false);prov=new E.BrowserProvider(window.ethereum);await prov.send("eth_requestAccounts",[]);signer=await prov.getSigner();$("cw").textContent=short(await signer.getAddress())}catch(e){say(e.message,false)}};
+$("load").onclick=async()=>{try{if(!prov)return say("Connect wallet first",false);leash=new E.Contract($("addr").value.trim(),ABI,signer);token=new E.Contract(await leash.token(),T20,signer);dec=Number(await token.decimals());sym=await token.symbol();localStorage.setItem("leash",$("addr").value.trim());await refresh()}catch(e){say("Load failed: "+(e.shortMessage||e.message),false)}};
+async function refresh(){if(!leash)return;try{
+const[o,p,bal]=await Promise.all([leash.owner(),leash.paused(),token.balanceOf(await leash.getAddress())]);
+$("info").textContent=`Owner ${short(o)} · Vault ${fmt(bal)} ${sym} · ${p?"PAUSED":"active"}`;
+const a=$("agent").value.trim();if(E.isAddress(a)){const[pol,sp,rem]=await Promise.all([leash.policies(a),leash.windowSpent(a),leash.remainingAllowance(a)]);
+const exp=Number(pol.expiry),live=pol.active&&exp*1000>Date.now();
+$("stats").innerHTML=[["Status",live?"ACTIVE":(pol.active?"EXPIRED":"REVOKED / none")],["Per-tx cap",fmt(pol.perTxCap)+" "+sym],["24h cap",fmt(pol.windowCap)+" "+sym],["Spent (24h)",fmt(sp)],["Remaining",fmt(rem)],["Approve above",fmt(pol.approvalThreshold)],["Min trust",pol.minTrust],["Expires",exp?new Date(exp*1000).toLocaleString():"-"]].map(x=>`<div class="mu">${x[0]}<b style="color:var(--tx)">${x[1]}</b></div>`).join("")}
+await pending();await feed()}catch(e){say("Refresh failed: "+(e.shortMessage||e.message),false)}}
+async function pending(){const n=Number(await leash.nextRequestId());let h="<tr><th>#</th><th>To</th><th>Amount</th><th></th></tr>";
+for(let i=Math.max(1,n-20);i<n;i++){const r=await leash.requests(i);if(Number(r.status)===1)h+=`<tr><td>${i}</td><td>${short(r.to)}</td><td>${fmt(r.amount)}</td><td><button onclick="act('approve',${i})">Approve</button> <button class="g" onclick="act('reject',${i})">Reject</button></td></tr>`}
+$("pend").innerHTML=h}
+window.act=(f,i)=>run(f+" #"+i,()=>leash[f](i));
+async function feed(){try{const head=await prov.getBlockNumber();const fb=Number($("fromBlock").value)||Math.max(0,head-100000);
+const [a,b,c]=await Promise.all([leash.queryFilter(leash.filters.Paid(),fb),leash.queryFilter(leash.filters.ApprovalRequested(),fb),leash.queryFilter(leash.filters.AgentRevoked(),fb)]);
+const all=[...a.map(e=>[e,"PAID",short(e.args.to)+" "+fmt(e.args.amount)]),...b.map(e=>[e,"NEEDS APPROVAL",short(e.args.to)+" "+fmt(e.args.amount)]),...c.map(e=>[e,"REVOKED",short(e.args.agent)])].sort((x,y)=>y[0].blockNumber-x[0].blockNumber).slice(0,30);
+$("feed").innerHTML="<tr><th>Event</th><th>Detail</th><th>Tx</th></tr>"+all.map(x=>`<tr><td>${x[1]}</td><td>${x[2]}</td><td>${short(x[0].transactionHash)}</td></tr>`).join("")}catch(e){$("feed").innerHTML="<tr><td class=mu>Feed unavailable (set 'deploy block' if your RPC limits ranges): "+(e.shortMessage||e.message)+"</td></tr>"}}
+const ag=()=>{const a=$("agent").value.trim();if(!E.isAddress(a))throw new Error("Enter a valid agent address");return a};
+$("refresh").onclick=refresh;
+$("bFund").onclick=()=>run("Fund",()=>token.transfer(leash.target,par($("fund").value)));
+$("bWd").onclick=async()=>run("Withdraw",async()=>leash.withdraw(await signer.getAddress(),par($("wd").value)));
+$("bPol").onclick=()=>run("Set policy",()=>leash.setPolicy(ag(),{active:true,expiry:Math.floor(Date.now()/1000)+86400*Number($("days").value||7),perTxCap:par($("perTx").value),windowCap:par($("win").value),approvalThreshold:par($("appr").value||$("perTx").value),minTrust:Number($("trust").value||0)}));
+$("bAllow").onclick=()=>run("Allowlist",()=>leash.setAllowed($("cp").value.trim(),true));
+$("bDeny").onclick=()=>run("Denylist",()=>leash.setDenied($("cp").value.trim(),true));
+$("bRevoke").onclick=()=>run("Revoke",()=>leash.revoke(ag()));
+$("bPause").onclick=()=>run("Pause",()=>leash.pause());$("bUnpause").onclick=()=>run("Unpause",()=>leash.unpause());
+$("addr").value=localStorage.getItem("leash")||"";
+</script></body></html>
