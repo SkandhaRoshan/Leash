@@ -85,3 +85,132 @@ contract MockIdentity {
         return owners[id];
     }
 }
+
+contract MockIncidentIdentity {
+    mapping(uint256 => address) public owners;
+    mapping(uint256 => address) public approved;
+    mapping(address => mapping(address => bool)) public operators;
+
+    function mint(uint256 id, address to) external {
+        owners[id] = to;
+    }
+
+    function ownerOf(uint256 id) public view returns (address) {
+        require(owners[id] != address(0), "ERC721NonexistentToken");
+        return owners[id];
+    }
+
+    function approve(uint256 id, address operator) external {
+        require(msg.sender == ownerOf(id), "not token owner");
+        approved[id] = operator;
+    }
+
+    function setApprovalForAll(address operator, bool isApproved) external {
+        operators[msg.sender][operator] = isApproved;
+    }
+
+    function isAuthorizedOrOwner(address spender, uint256 id) external view returns (bool) {
+        address tokenOwner = ownerOf(id);
+        return spender == tokenOwner || approved[id] == spender || operators[tokenOwner][spender];
+    }
+}
+
+interface IIncidentPolicyReader {
+    function policies(address agent)
+        external
+        view
+        returns (bool active, uint64 expiry, uint128 perTxCap, uint128 windowCap, uint128 approvalThreshold, uint8 minTrust);
+}
+
+contract MockIncidentRegistry {
+    struct Feedback {
+        int128 value;
+        uint8 decimals;
+        string tag1;
+        string tag2;
+        bytes32 feedbackHash;
+    }
+
+    address public immutable identity;
+    bool public shouldRevert;
+    bool public consumeGas;
+    bool public policyActiveDuringCall;
+    mapping(uint256 => mapping(address => uint64)) public lastIndex;
+    mapping(uint256 => mapping(address => mapping(uint64 => Feedback))) private _feedback;
+
+    constructor(address identity_) {
+        identity = identity_;
+    }
+
+    function setBehavior(bool shouldRevert_, bool consumeGas_) external {
+        shouldRevert = shouldRevert_;
+        consumeGas = consumeGas_;
+    }
+
+    function getIdentityRegistry() external view returns (address) {
+        return identity;
+    }
+
+    function giveFeedback(
+        uint256 agentId,
+        int128 value,
+        uint8 valueDecimals,
+        string calldata tag1,
+        string calldata tag2,
+        string calldata,
+        string calldata,
+        bytes32 feedbackHash
+    ) external {
+        if (consumeGas) {
+            while (gasleft() > 0) {}
+        }
+        require(!shouldRevert, "mock feedback failure");
+        _storeFeedback(agentId, value, valueDecimals, tag1, tag2, feedbackHash);
+    }
+
+    function _storeFeedback(
+        uint256 agentId,
+        int128 value,
+        uint8 valueDecimals,
+        string calldata tag1,
+        string calldata tag2,
+        bytes32 feedbackHash
+    ) private {
+        MockIncidentIdentity idRegistry = MockIncidentIdentity(identity);
+        require(!idRegistry.isAuthorizedOrOwner(msg.sender, agentId), "Self-feedback not allowed");
+        (policyActiveDuringCall,,,,,) = IIncidentPolicyReader(msg.sender).policies(idRegistry.ownerOf(agentId));
+
+        uint64 index = lastIndex[agentId][msg.sender] + 1;
+        lastIndex[agentId][msg.sender] = index;
+        _feedback[agentId][msg.sender][index] = Feedback(value, valueDecimals, tag1, tag2, feedbackHash);
+    }
+
+    function readFeedback(uint256 agentId, address client, uint64 index)
+        external
+        view
+        returns (int128 value, uint8 decimals, string memory tag1, string memory tag2, bytes32 feedbackHash)
+    {
+        Feedback storage feedback = _feedback[agentId][client][index];
+        return (feedback.value, feedback.decimals, feedback.tag1, feedback.tag2, feedback.feedbackHash);
+    }
+
+    function getSummary(uint256 agentId, address[] calldata clients, string calldata tag1, string calldata tag2)
+        external
+        view
+        returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals)
+    {
+        require(clients.length > 0, "clientAddresses required");
+        summaryValueDecimals = 0;
+        int256 sum;
+        for (uint256 i; i < clients.length; i++) {
+            for (uint64 index = 1; index <= lastIndex[agentId][clients[i]]; index++) {
+                Feedback storage feedback = _feedback[agentId][clients[i]][index];
+                if (bytes(tag1).length != 0 && keccak256(bytes(tag1)) != keccak256(bytes(feedback.tag1))) continue;
+                if (bytes(tag2).length != 0 && keccak256(bytes(tag2)) != keccak256(bytes(feedback.tag2))) continue;
+                sum += feedback.value;
+                count++;
+            }
+        }
+        if (count > 0) summaryValue = int128(sum / int256(uint256(count)));
+    }
+}

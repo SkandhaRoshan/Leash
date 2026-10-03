@@ -8,6 +8,25 @@ import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IReputationSource} from "./interfaces/IReputationSource.sol";
 
+interface IERC8004FeedbackRegistry {
+    function getIdentityRegistry() external view returns (address);
+
+    function giveFeedback(
+        uint256 agentId,
+        int128 value,
+        uint8 valueDecimals,
+        string calldata tag1,
+        string calldata tag2,
+        string calldata endpoint,
+        string calldata feedbackURI,
+        bytes32 feedbackHash
+    ) external;
+}
+
+interface IERC8004IdentityRegistry {
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
 /// @title Leash
 /// @notice A spending vault for AI agents. The owner funds it with a stablecoin (e.g. USDG)
 ///         and grants each agent session key a Policy. The CONTRACT enforces the policy:
@@ -55,6 +74,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     ///      is a conservative (never-exceeds-cap) rolling window.
     uint256 public constant BUCKETS = 25;
     uint256 public constant REQUEST_TTL = 1 days;
+    uint256 public constant INCIDENT_REPORT_GAS = 300_000;
+    uint256 private constant INCIDENT_GAS_RESERVE = 35_000;
 
     bytes32 public constant REASON_EXCEEDS_PER_TX_CAP = keccak256("ExceedsPerTxCap");
     bytes32 public constant REASON_WINDOW_CAP_EXCEEDED = keccak256("WindowCapExceeded");
@@ -77,6 +98,9 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     mapping(address => Bucket[25]) private _buckets;
     mapping(address => uint256) public strikes;
     uint256 public maxStrikes = 3;
+    address public feedbackRegistry;
+    mapping(address => uint256) public agentIdOf;
+    mapping(address => bool) public agentIdLinked;
 
     uint256 public nextRequestId = 1;
     mapping(uint256 => Request) public requests;
@@ -96,6 +120,10 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     event PaymentBlocked(address indexed agent, address indexed to, uint256 amount, bytes32 reasonCode);
     /// @notice Emitted when an agent is automatically revoked after reaching the strike limit.
     event AgentAutoRevoked(address indexed agent, uint256 strikes);
+    event FeedbackRegistrySet(address indexed registry);
+    event AgentIdLinked(address indexed agent, uint256 indexed agentId);
+    event IncidentReported(address indexed agent, uint256 indexed agentId, bool success);
+    event IncidentReportFailed(address indexed agent, uint256 indexed agentId);
 
     // ----------------------------------------------------------------- errors
     error NotAgent();
@@ -111,6 +139,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     error BadRequest();
     error RequestExpired();
     error ZeroAddress();
+    error FeedbackRegistryNotSet();
+    error AgentIdOwnerMismatch(address expected, address actual);
 
     constructor(address token_, address owner_) Ownable(owner_) {
         if (token_ == address(0)) revert ZeroAddress();
@@ -232,6 +262,21 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         maxStrikes = n;
     }
 
+    function setFeedbackRegistry(address registry) external onlyOwner {
+        feedbackRegistry = registry;
+        emit FeedbackRegistrySet(registry);
+    }
+
+    function linkAgentId(address agent, uint256 agentId) external onlyOwner {
+        if (feedbackRegistry == address(0)) revert FeedbackRegistryNotSet();
+        address identityRegistry = IERC8004FeedbackRegistry(feedbackRegistry).getIdentityRegistry();
+        address actualOwner = IERC8004IdentityRegistry(identityRegistry).ownerOf(agentId);
+        if (actualOwner != agent) revert AgentIdOwnerMismatch(agent, actualOwner);
+        agentIdOf[agent] = agentId;
+        agentIdLinked[agent] = true;
+        emit AgentIdLinked(agent, agentId);
+    }
+
     function setAllowed(address account, bool allowed) external onlyOwner {
         allowlist[account] = allowed;
         emit AllowlistSet(account, allowed);
@@ -348,6 +393,30 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         if (strikes[agent] >= maxStrikes && policies[agent].active) {
             _revokeAgent(agent);
             emit AgentAutoRevoked(agent, strikes[agent]);
+            _reportIncident(agent);
+        }
+    }
+
+    function _reportIncident(address agent) internal {
+        if (feedbackRegistry == address(0) || !agentIdLinked[agent]) return;
+        uint256 agentId = agentIdOf[agent];
+        if (gasleft() <= INCIDENT_REPORT_GAS + INCIDENT_GAS_RESERVE) {
+            emit IncidentReportFailed(agent, agentId);
+            return;
+        }
+
+        bytes32 feedbackHash = keccak256(
+            abi.encode(address(this), agent, strikes[agent], block.chainid, block.timestamp)
+        );
+
+        // Revocation is already committed and tryPay holds the reentrancy guard; the capped,
+        // caught registry call cannot undo revocation or re-enter guarded payment actions.
+        try IERC8004FeedbackRegistry(feedbackRegistry).giveFeedback{gas: INCIDENT_REPORT_GAS}(
+            agentId, -100, 0, "leash", "auto-revoked", "", "", feedbackHash
+        ) {
+            emit IncidentReported(agent, agentId, true);
+        } catch {
+            emit IncidentReportFailed(agent, agentId);
         }
     }
 }

@@ -29,12 +29,15 @@ const $=id=>document.getElementById(id),E=ethers;
 const ABI=["function owner() view returns (address)","function token() view returns (address)","function paused() view returns (bool)",
 "function policies(address) view returns (bool active,uint64 expiry,uint128 perTxCap,uint128 windowCap,uint128 approvalThreshold,uint8 minTrust)",
 "function windowSpent(address) view returns (uint256)","function remainingAllowance(address) view returns (uint256)","function nextRequestId() view returns (uint256)",
+"function strikes(address) view returns (uint256)","function getStrikes(address) view returns (uint256)","function maxStrikes() view returns (uint256)",
 "function requests(uint256) view returns (address agent,address to,uint128 amount,uint64 createdAt,bytes32 ref,uint8 status)",
 "function setPolicy(address,(bool active,uint64 expiry,uint128 perTxCap,uint128 windowCap,uint128 approvalThreshold,uint8 minTrust))",
 "function revoke(address)","function setAllowed(address,bool)","function setDenied(address,bool)","function pause()","function unpause()","function approve(uint256)","function reject(uint256)","function withdraw(address,uint256)",
 "event Paid(address indexed agent,address indexed to,uint256 amount,bytes32 ref)","event ApprovalRequested(uint256 indexed id,address indexed agent,address indexed to,uint256 amount,bytes32 ref)","event AgentRevoked(address indexed agent)",
+"event PaymentBlocked(address indexed agent,address indexed to,uint256 amount,bytes32 reasonCode)","event AgentAutoRevoked(address indexed agent,uint256 strikes)","event IncidentReported(address indexed agent,uint256 indexed agentId,bool success)","event IncidentReportFailed(address indexed agent,uint256 indexed agentId)",
 "error ExceedsPerTxCap(uint256,uint256)","error WindowCapExceeded(uint256,uint256,uint256)","error NotAllowlisted(address)","error CounterpartyDenied(address)","error TrustTooLow(uint256,uint256)","error TrustUnavailable(address)","error NotAgent()","error PolicyExpired()","error InvalidPolicy()","error ZeroAmount()","error BadRequest()","error RequestExpired()","error OwnableUnauthorizedAccount(address)","error EnforcedPause()"];
 const T20=["function balanceOf(address) view returns (uint256)","function decimals() view returns (uint8)","function symbol() view returns (string)","function transfer(address,uint256) returns (bool)"];
+const REASON_NAMES=Object.fromEntries(["ExceedsPerTxCap","WindowCapExceeded","NotAllowlisted","LowTrust","PolicyExpired","NotAgent","Paused","ZeroAmount","Denylisted","ApprovalRequired"].map(n=>[E.keccak256(E.toUtf8Bytes(n)).toLowerCase(),n]));
 let prov,signer,leash,token,dec=6,sym="USD";
 const fmt=v=>E.formatUnits(v,dec),par=v=>E.parseUnits(v||"0",dec),short=a=>a.slice(0,6)+"…"+a.slice(-4);
 function say(t,ok){const m=$("msg");m.className=ok?"ok":"err";m.textContent=t;if(ok)setTimeout(()=>m.className="",4000)}
@@ -45,17 +48,17 @@ $("load").onclick=async()=>{try{if(!prov)return say("Connect wallet first",false
 async function refresh(){if(!leash)return;try{
 const[o,p,bal]=await Promise.all([leash.owner(),leash.paused(),token.balanceOf(await leash.getAddress())]);
 $("info").textContent=`Owner ${short(o)} · Vault ${fmt(bal)} ${sym} · ${p?"PAUSED":"active"}`;
-const a=$("agent").value.trim();if(E.isAddress(a)){const[pol,sp,rem]=await Promise.all([leash.policies(a),leash.windowSpent(a),leash.remainingAllowance(a)]);
+const a=$("agent").value.trim();if(E.isAddress(a)){const[pol,sp,rem,strikes,maxStrikes]=await Promise.all([leash.policies(a),leash.windowSpent(a),leash.remainingAllowance(a),leash.strikes(a),leash.maxStrikes()]);
 const exp=Number(pol.expiry),live=pol.active&&exp*1000>Date.now();
-$("stats").innerHTML=[["Status",live?"ACTIVE":(pol.active?"EXPIRED":"REVOKED / none")],["Per-tx cap",fmt(pol.perTxCap)+" "+sym],["24h cap",fmt(pol.windowCap)+" "+sym],["Spent (24h)",fmt(sp)],["Remaining",fmt(rem)],["Approve above",fmt(pol.approvalThreshold)],["Min trust",pol.minTrust],["Expires",exp?new Date(exp*1000).toLocaleString():"-"]].map(x=>`<div class="mu">${x[0]}<b style="color:var(--tx)">${x[1]}</b></div>`).join("")}
+$("stats").innerHTML=[["Status",live?"ACTIVE":(pol.active?"EXPIRED":"REVOKED / none")],["Per-tx cap",fmt(pol.perTxCap)+" "+sym],["24h cap",fmt(pol.windowCap)+" "+sym],["Spent (24h)",fmt(sp)],["Remaining",fmt(rem)],["Strikes / auto-revoke",`${strikes} / ${maxStrikes}`],["Approve above",fmt(pol.approvalThreshold)],["Min trust",pol.minTrust],["Expires",exp?new Date(exp*1000).toLocaleString():"-"]].map(x=>`<div class="mu">${x[0]}<b style="color:var(--tx)">${x[1]}</b></div>`).join("")}
 await pending();await feed()}catch(e){say("Refresh failed: "+(e.shortMessage||e.message),false)}}
 async function pending(){const n=Number(await leash.nextRequestId());let h="<tr><th>#</th><th>To</th><th>Amount</th><th></th></tr>";
 for(let i=Math.max(1,n-20);i<n;i++){const r=await leash.requests(i);if(Number(r.status)===1)h+=`<tr><td>${i}</td><td>${short(r.to)}</td><td>${fmt(r.amount)}</td><td><button onclick="act('approve',${i})">Approve</button> <button class="g" onclick="act('reject',${i})">Reject</button></td></tr>`}
 $("pend").innerHTML=h}
 window.act=(f,i)=>run(f+" #"+i,()=>leash[f](i));
 async function feed(){try{const head=await prov.getBlockNumber();const fb=Number($("fromBlock").value)||Math.max(0,head-100000);
-const [a,b,c]=await Promise.all([leash.queryFilter(leash.filters.Paid(),fb),leash.queryFilter(leash.filters.ApprovalRequested(),fb),leash.queryFilter(leash.filters.AgentRevoked(),fb)]);
-const all=[...a.map(e=>[e,"PAID",short(e.args.to)+" "+fmt(e.args.amount)]),...b.map(e=>[e,"NEEDS APPROVAL",short(e.args.to)+" "+fmt(e.args.amount)]),...c.map(e=>[e,"REVOKED",short(e.args.agent)])].sort((x,y)=>y[0].blockNumber-x[0].blockNumber).slice(0,30);
+const [a,b,c,d,e,f,g]=await Promise.all([leash.queryFilter(leash.filters.Paid(),fb),leash.queryFilter(leash.filters.ApprovalRequested(),fb),leash.queryFilter(leash.filters.AgentRevoked(),fb),leash.queryFilter(leash.filters.PaymentBlocked(),fb),leash.queryFilter(leash.filters.AgentAutoRevoked(),fb),leash.queryFilter(leash.filters.IncidentReported(),fb),leash.queryFilter(leash.filters.IncidentReportFailed(),fb)]);
+const all=[...a.map(e=>[e,"PAID",short(e.args.to)+" "+fmt(e.args.amount)]),...b.map(e=>[e,"NEEDS APPROVAL",short(e.args.to)+" "+fmt(e.args.amount)]),...c.map(e=>[e,"REVOKED",short(e.args.agent)]),...d.map(e=>[e,"BLOCKED · "+(REASON_NAMES[e.args.reasonCode.toLowerCase()]||e.args.reasonCode),short(e.args.agent)+" → "+short(e.args.to)+" "+fmt(e.args.amount)]),...e.map(e=>[e,"AUTO-REVOKED",short(e.args.agent)+" · "+e.args.strikes+" strikes"]),...f.map(e=>[e,"INCIDENT REPORTED",short(e.args.agent)+" · agentId "+e.args.agentId]),...g.map(e=>[e,"INCIDENT REPORT FAILED",short(e.args.agent)+" · agentId "+e.args.agentId])].sort((x,y)=>y[0].blockNumber-x[0].blockNumber).slice(0,30);
 $("feed").innerHTML="<tr><th>Event</th><th>Detail</th><th>Tx</th></tr>"+all.map(x=>`<tr><td>${x[1]}</td><td>${x[2]}</td><td>${short(x[0].transactionHash)}</td></tr>`).join("")}catch(e){$("feed").innerHTML="<tr><td class=mu>Feed unavailable (set 'deploy block' if your RPC limits ranges): "+(e.shortMessage||e.message)+"</td></tr>"}}
 const ag=()=>{const a=$("agent").value.trim();if(!E.isAddress(a))throw new Error("Enter a valid agent address");return a};
 $("refresh").onclick=refresh;

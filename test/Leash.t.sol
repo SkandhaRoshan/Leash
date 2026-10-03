@@ -5,11 +5,20 @@ import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {Leash} from "../src/Leash.sol";
 import {ERC8004ReputationAdapter} from "../src/adapters/ERC8004ReputationAdapter.sol";
-import {MockUSDG, MockReputation, MockERC8004Registry, MockIdentity} from "./mocks/Mocks.sol";
+import {
+    MockUSDG,
+    MockReputation,
+    MockERC8004Registry,
+    MockIdentity,
+    MockIncidentIdentity,
+    MockIncidentRegistry
+} from "./mocks/Mocks.sol";
 
 contract LeashTest is Test {
     event PaymentBlocked(address indexed agent, address indexed to, uint256 amount, bytes32 reasonCode);
     event AgentAutoRevoked(address indexed agent, uint256 strikes);
+    event IncidentReported(address indexed agent, uint256 indexed agentId, bool success);
+    event IncidentReportFailed(address indexed agent, uint256 indexed agentId);
 
     Leash leash;
     MockUSDG usdg;
@@ -61,6 +70,27 @@ contract LeashTest is Test {
         emit PaymentBlocked(eventAgent, to, amount, reasonCode);
         vm.prank(caller);
         return leash.tryPay(attemptedAgent, to, amount);
+    }
+
+    function _incidentSetup(uint256 agentId) internal returns (MockIncidentIdentity identity, MockIncidentRegistry registry) {
+        identity = new MockIncidentIdentity();
+        identity.mint(agentId, agent);
+        registry = new MockIncidentRegistry(address(identity));
+        vm.startPrank(owner);
+        leash.setFeedbackRegistry(address(registry));
+        leash.linkAgentId(agent, agentId);
+        vm.stopPrank();
+    }
+
+    function _eventExists(Vm.Log[] memory logs, bytes32 eventTopic) internal pure returns (bool) {
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == eventTopic) return true;
+        }
+        return false;
+    }
+
+    function _policyIsActive(address account) internal view returns (bool active) {
+        (active,,,,,) = leash.policies(account);
     }
 
     // ------------------------------------------------------------ happy path
@@ -281,6 +311,172 @@ contract LeashTest is Test {
         for (uint256 i; i < entries.length; i++) assertTrue(entries[i].topics[0] != blockedTopic);
         assertEq(leash.strikes(agent), 0);
         assertEq(usdg.balanceOf(merchant), U);
+    }
+
+    function test_incidentReportedOnAutoRevoke() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertTrue(_eventExists(logs, keccak256("IncidentReported(address,uint256,bool)")));
+        assertEq(registry.lastIndex(42, address(leash)), 1);
+        assertFalse(registry.policyActiveDuringCall());
+        (bool active,,,,,) = leash.policies(agent);
+        assertFalse(active);
+
+        address[] memory clients = new address[](1);
+        clients[0] = address(leash);
+        (uint64 count, int128 value, uint8 decimals) = registry.getSummary(42, clients, "leash", "auto-revoked");
+        assertEq(count, 1);
+        assertEq(value, -100);
+        assertEq(decimals, 0);
+    }
+
+    function test_incidentNotReportedWhenUnconfigured() public {
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertFalse(_eventExists(logs, keccak256("IncidentReported(address,uint256,bool)")));
+        assertFalse(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertFalse(_policyIsActive(agent));
+    }
+
+    function test_zeroFeedbackRegistryDisablesReporting() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.startPrank(owner);
+        leash.setFeedbackRegistry(address(0));
+        leash.setMaxStrikes(1);
+        vm.stopPrank();
+
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        assertEq(registry.lastIndex(42, address(leash)), 0);
+        assertFalse(_eventExists(vm.getRecordedLogs(), keccak256("IncidentReported(address,uint256,bool)")));
+    }
+
+    function test_incidentNotReportedWhenUnlinked() public {
+        MockIncidentIdentity identity = new MockIncidentIdentity();
+        identity.mint(42, agent);
+        MockIncidentRegistry registry = new MockIncidentRegistry(address(identity));
+        vm.startPrank(owner);
+        leash.setFeedbackRegistry(address(registry));
+        leash.setMaxStrikes(1);
+        vm.stopPrank();
+
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        assertEq(registry.lastIndex(42, address(leash)), 0);
+        assertFalse(leash.agentIdLinked(agent));
+    }
+
+    function test_incidentRegistryRevertDoesNotPreventRevocation() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        registry.setBehavior(true, false);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertTrue(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertFalse(_policyIsActive(agent));
+    }
+
+    function test_incidentRegistryGasExhaustionDoesNotPreventRevocation() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        registry.setBehavior(false, true);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertTrue(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertFalse(_policyIsActive(agent));
+    }
+
+    function test_linkAgentIdRejectsIdNotOwnedByAgent() public {
+        MockIncidentIdentity identity = new MockIncidentIdentity();
+        identity.mint(42, stranger);
+        MockIncidentRegistry registry = new MockIncidentRegistry(address(identity));
+        vm.prank(owner);
+        leash.setFeedbackRegistry(address(registry));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Leash.AgentIdOwnerMismatch.selector, agent, stranger));
+        leash.linkAgentId(agent, 42);
+        assertFalse(leash.agentIdLinked(agent));
+    }
+
+    function test_feedbackRegistryAndLinkRequireOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        leash.setFeedbackRegistry(address(1));
+        vm.prank(attacker);
+        vm.expectRevert();
+        leash.linkAgentId(agent, 42);
+    }
+
+    function test_strikesBelowLimitDoNotWriteFeedback() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        assertEq(leash.strikes(agent), 1);
+        assertEq(registry.lastIndex(42, address(leash)), 0);
+        assertTrue(_policyIsActive(agent));
+    }
+
+    function test_incidentFeedbackHashDiffersPerIncident() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        (,,,, bytes32 firstHash) = registry.readFeedback(42, address(leash), 1);
+
+        vm.startPrank(owner);
+        leash.resetStrikes(agent);
+        leash.setPolicy(agent, _policy(10 * U, 25 * U, 5 * U, 0));
+        vm.stopPrank();
+        vm.warp(block.timestamp + 1);
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        (,,,, bytes32 secondHash) = registry.readFeedback(42, address(leash), 2);
+        assertTrue(firstHash != secondHash);
+    }
+
+    function test_incidentMockRejectsOwnerSelfFeedback() public {
+        MockIncidentIdentity identity = new MockIncidentIdentity();
+        identity.mint(42, agent);
+        MockIncidentRegistry registry = new MockIncidentRegistry(address(identity));
+        vm.prank(agent);
+        vm.expectRevert(bytes("Self-feedback not allowed"));
+        registry.giveFeedback(42, -100, 0, "leash", "auto-revoked", "", "", bytes32(uint256(1)));
+    }
+
+    function test_incidentMockRejectsApprovedOperatorAndRevocationStillSucceeds() public {
+        (MockIncidentIdentity identity, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.prank(agent);
+        identity.setApprovalForAll(address(leash), true);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertTrue(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertEq(registry.lastIndex(42, address(leash)), 0);
+        assertFalse(_policyIsActive(agent));
     }
 
     // ------------------------------------------------------- reputation gating
