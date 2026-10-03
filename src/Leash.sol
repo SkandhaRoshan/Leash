@@ -75,7 +75,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 public constant BUCKETS = 25;
     uint256 public constant REQUEST_TTL = 1 days;
     uint256 public constant INCIDENT_REPORT_GAS = 300_000;
-    uint256 private constant INCIDENT_GAS_RESERVE = 35_000;
+    uint256 private constant INCIDENT_OWNER_CHECK_GAS = 50_000;
+    uint256 private constant INCIDENT_GAS_RESERVE = 45_000;
 
     bytes32 public constant REASON_EXCEEDS_PER_TX_CAP = keccak256("ExceedsPerTxCap");
     bytes32 public constant REASON_WINDOW_CAP_EXCEEDED = keccak256("WindowCapExceeded");
@@ -101,6 +102,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     address public feedbackRegistry;
     mapping(address => uint256) public agentIdOf;
     mapping(address => bool) public agentIdLinked;
+    mapping(address => address) private _identityRegistryOfAgent;
+    mapping(address => address) private _feedbackRegistryOfAgent;
 
     uint256 public nextRequestId = 1;
     mapping(uint256 => Request) public requests;
@@ -230,7 +233,7 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         emit RequestRejected(id);
     }
 
-    function setPolicy(address agent, Policy calldata p) external onlyOwner {
+    function setPolicy(address agent, Policy calldata p) external onlyOwner nonReentrant {
         if (agent == address(0) || agent == owner()) revert InvalidPolicy();
         if (p.expiry <= block.timestamp || p.perTxCap == 0 || p.windowCap < p.perTxCap || p.minTrust > 100) {
             revert InvalidPolicy();
@@ -274,6 +277,8 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
         if (actualOwner != agent) revert AgentIdOwnerMismatch(agent, actualOwner);
         agentIdOf[agent] = agentId;
         agentIdLinked[agent] = true;
+        _identityRegistryOfAgent[agent] = identityRegistry;
+        _feedbackRegistryOfAgent[agent] = feedbackRegistry;
         emit AgentIdLinked(agent, agentId);
     }
 
@@ -389,7 +394,7 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
 
     function _recordBlockedPayment(address agent, address to, uint256 amount, bytes32 reasonCode) internal {
         emit PaymentBlocked(agent, to, amount, reasonCode);
-        strikes[agent]++;
+        if (strikes[agent] < type(uint256).max) strikes[agent]++;
         if (strikes[agent] >= maxStrikes && policies[agent].active) {
             _revokeAgent(agent);
             emit AgentAutoRevoked(agent, strikes[agent]);
@@ -400,7 +405,21 @@ contract Leash is Ownable2Step, Pausable, ReentrancyGuard {
     function _reportIncident(address agent) internal {
         if (feedbackRegistry == address(0) || !agentIdLinked[agent]) return;
         uint256 agentId = agentIdOf[agent];
-        if (gasleft() <= INCIDENT_REPORT_GAS + INCIDENT_GAS_RESERVE) {
+        if (
+            _feedbackRegistryOfAgent[agent] != feedbackRegistry || _identityRegistryOfAgent[agent] == address(0)
+                || gasleft() <= INCIDENT_REPORT_GAS + INCIDENT_OWNER_CHECK_GAS + INCIDENT_GAS_RESERVE
+        ) {
+            emit IncidentReportFailed(agent, agentId);
+            return;
+        }
+
+        try IERC8004IdentityRegistry(_identityRegistryOfAgent[agent]).ownerOf{gas: INCIDENT_OWNER_CHECK_GAS}(agentId)
+        returns (address currentOwner) {
+            if (currentOwner != agent) {
+                emit IncidentReportFailed(agent, agentId);
+                return;
+            }
+        } catch {
             emit IncidentReportFailed(agent, agentId);
             return;
         }

@@ -21,7 +21,7 @@ echo "[agent] !! injected instruction obeyed: pay $AMT USDG to $TARGET"
 echo "[owner] Fund vault and configure active policy (merchant allowlisted, minTrust 80)"
 cast send "$TOKEN" "transfer(address,uint256)" "$LEASH" $((40*U)) --private-key "$OWNER_KEY" --rpc-url "$RPC" >/dev/null
 cast send "$LEASH" "setAllowed(address,bool)" "$MERCHANT" true --private-key "$OWNER_KEY" --rpc-url "$RPC" >/dev/null
-cast send "$LEASH" "setPolicy(address,(bool,uint64,uint128,uint128,uint128,uint8))" "$AGENT" "(true,$EXP,$((10*U)),$((25*U)),$((5*U)),80)" --private-key "$OWNER_KEY" --rpc-url "$RPC" >/dev/null
+cast send "$LEASH" "setPolicy(address,(bool,uint64,uint128,uint128,uint128,uint8))" "$AGENT" "(true,$EXP,$((50*U)),$((100*U)),$((50*U)),80)" --private-key "$OWNER_KEY" --rpc-url "$RPC" >/dev/null
 echo "   merchant: $MERCHANT | vault balance: $(bal "$LEASH")"
 echo "[owner] Agent key ready: $AGENT"
 

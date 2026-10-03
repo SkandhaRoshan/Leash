@@ -1,42 +1,56 @@
-'forge clean' running (wd: C:\Users\DELL\Downloads\leash\leash)
+﻿'forge clean' running (wd: C:\Users\DELL\Downloads\leash\leash)
 'forge config --json' running
 'forge build --build-info --deny never --skip ./test/** ./script/** --force' running (wd: C:\Users\DELL\Downloads\leash\leash)
 INFO:Detectors:
 Detector: weak-prng
-Leash._spend(address,Leash.Policy,address,uint256,bytes32) (src/Leash.sol#252-266) uses a weak PRNG: "b = _buckets[agent][id % BUCKETS] (src/Leash.sol#257)" 
+Leash._spend(address,Leash.Policy,address,uint256,bytes32) (src/Leash.sol#369-381) uses a weak PRNG: "b = _buckets[agent][id % BUCKETS] (src/Leash.sol#374-376)"
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#weak-PRNG
 INFO:Detectors:
+Detector: uninitialized-local
+Leash.tryPay(address,address,uint256).reasonCode (src/Leash.sol#174) is a local variable never initialized
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#uninitialized-local-variables
+INFO:Detectors:
 Detector: unused-return
-ERC8004ReputationAdapter.link(address,uint256) (src/adapters/ERC8004ReputationAdapter.sol#60-69) ignores return value by IERC721Owner(registry.getIdentityRegistry()).ownerOf(agentId) (src/adapters/ERC8004ReputationAdapter.sol#62-65)
+ERC8004ReputationAdapter.link(address,uint256) (src/adapters/ERC8004ReputationAdapter.sol#59-67) ignores return value by IERC721Owner(registry.getIdentityRegistry()).ownerOf(agentId) (src/adapters/ERC8004ReputationAdapter.sol#61-63)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#unused-return
+INFO:Detectors:
+Detector: events-maths
+Leash.setMaxStrikes(uint256) (src/Leash.sol#255-259) should emit an event for:
+	- maxStrikes = n (src/Leash.sol#258)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-events-arithmetic
 INFO:Detectors:
 Detector: missing-zero-check
 Ownable2Step.transferOwnership(address).newOwner (lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol#41-43) lacks a zero-check on :
 		- _pendingOwner = newOwner (lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol#43)
+Leash.setFeedbackRegistry(address).registry (src/Leash.sol#262) lacks a zero-check on :
+		- feedbackRegistry = registry (src/Leash.sol#262)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-zero-address-validation
 INFO:Detectors:
 Detector: timestamp
-Leash.approve(uint256) (src/Leash.sol#124-135) uses timestamp for comparisons
+Leash.tryPay(address,address,uint256) (src/Leash.sol#172-204) uses timestamp for comparisons
 	Dangerous comparisons:
-	- block.timestamp > r.createdAt + REQUEST_TTL (src/Leash.sol#127)
-Leash.setPolicy(address,Leash.Policy) (src/Leash.sol#145-154) uses timestamp for comparisons
+	- block.timestamp >= p.expiry (src/Leash.sol#177-178)
+Leash.approve(uint256) (src/Leash.sol#205-221) uses timestamp for comparisons
 	Dangerous comparisons:
-	- p.expiry <= block.timestamp || p.perTxCap == 0 || p.windowCap < p.perTxCap || p.minTrust > 100 (src/Leash.sol#147)
-Leash.windowSpent(address) (src/Leash.sol#194-200) uses timestamp for comparisons
+	- block.timestamp > r.createdAt + REQUEST_TTL (src/Leash.sol#213-215)
+Leash.setPolicy(address,Leash.Policy) (src/Leash.sol#229-238) uses timestamp for comparisons
 	Dangerous comparisons:
-	- b.amount != 0 && b.id + BUCKETS > nowId && b.id <= nowId (src/Leash.sol#198)
-Leash.remainingAllowance(address) (src/Leash.sol#202-207) uses timestamp for comparisons
+	- p.expiry <= block.timestamp || p.perTxCap == 0 || p.windowCap < p.perTxCap || p.minTrust > 100 (src/Leash.sol#232-236)
+Leash.windowSpent(address) (src/Leash.sol#308-317) uses timestamp for comparisons
 	Dangerous comparisons:
-	- ! p.active || block.timestamp >= p.expiry (src/Leash.sol#204)
-Leash.checkPayment(address,address,uint256) (src/Leash.sol#211-229) uses timestamp for comparisons
+	- b.amount != 0 && b.id + BUCKETS > nowId && b.id <= nowId (src/Leash.sol#316)
+Leash.remainingAllowance(address) (src/Leash.sol#317-321) uses timestamp for comparisons
 	Dangerous comparisons:
-	- block.timestamp >= p.expiry (src/Leash.sol#215)
-Leash._activePolicy(address) (src/Leash.sol#233-237) uses timestamp for comparisons
+	- ! p.active || block.timestamp >= p.expiry (src/Leash.sol#319-320)
+Leash.checkPayment(address,address,uint256) (src/Leash.sol#329-347) uses timestamp for comparisons
 	Dangerous comparisons:
-	- block.timestamp >= p.expiry (src/Leash.sol#236)
-Leash._spend(address,Leash.Policy,address,uint256,bytes32) (src/Leash.sol#252-266) uses timestamp for comparisons
+	- block.timestamp >= p.expiry (src/Leash.sol#337)
+Leash._activePolicy(address) (src/Leash.sol#348-354) uses timestamp for comparisons
 	Dangerous comparisons:
-	- b.id != id (src/Leash.sol#258)
+	- block.timestamp >= p.expiry (src/Leash.sol#353-354)
+Leash._spend(address,Leash.Policy,address,uint256,bytes32) (src/Leash.sol#369-381) uses timestamp for comparisons
+	Dangerous comparisons:
+	- b.id != id (src/Leash.sol#377-379)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#block-timestamp
 INFO:Detectors:
 Detector: assembly
@@ -88,15 +102,19 @@ Detector: pragma
 		->=0.4.16 (lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol#2-4)
 		->=0.4.16 (lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol#2-4)
 	- Version constraint 0.8.26 is used by:
-		-0.8.26 (src/Leash.sol#2)
-		-0.8.26 (src/adapters/ERC8004ReputationAdapter.sol#2)
-		-0.8.26 (src/interfaces/IReputationSource.sol#2)
+		-0.8.26 (src/Leash.sol#1-2)
+		-0.8.26 (src/adapters/ERC8004ReputationAdapter.sol#1-2)
+		-0.8.26 (src/interfaces/IReputationSource.sol#1-2)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#different-pragma-directives-are-used
 INFO:Detectors:
 Detector: costly-loop
-ERC8004ReputationAdapter.setTrustedClient(address,bool) (src/adapters/ERC8004ReputationAdapter.sol#77-95) has costly operations inside a loop:
-	- _trustedClients.pop() (src/adapters/ERC8004ReputationAdapter.sol#89)
+ERC8004ReputationAdapter.setTrustedClient(address,bool) (src/adapters/ERC8004ReputationAdapter.sol#73-91) has costly operations inside a loop:
+	- _trustedClients.pop() (src/adapters/ERC8004ReputationAdapter.sol#87-88)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#costly-operations-inside-a-loop
+INFO:Detectors:
+Detector: cyclomatic-complexity
+Leash.tryPay(address,address,uint256) (src/Leash.sol#172-204) has a high cyclomatic complexity (14).
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#cyclomatic-complexity
 INFO:Detectors:
 Detector: solc-version
 Version constraint ^0.8.20 contains known severe issues (https://solidity.readthedocs.io/en/latest/bugs.html)
@@ -158,4 +176,4 @@ Detector: unindexed-event-address
 Event Pausable.Paused(address) (lib/openzeppelin-contracts/contracts/utils/Pausable.sol#21-23) has address parameters but no indexed parameters
 Event Pausable.Unpaused(address) (lib/openzeppelin-contracts/contracts/utils/Pausable.sol#26-28) has address parameters but no indexed parameters
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#unindexed-event-address-parameters
-INFO:Slither:. analyzed (16 contracts with 102 detectors), 30 result(s) found
+INFO:Slither:. analyzed (18 contracts with 102 detectors), 35 result(s) found

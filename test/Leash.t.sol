@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
+import {StdStorage, stdStorage} from "forge-std/StdStorage.sol";
 import {Leash} from "../src/Leash.sol";
 import {ERC8004ReputationAdapter} from "../src/adapters/ERC8004ReputationAdapter.sol";
 import {
@@ -15,6 +16,8 @@ import {
 } from "./mocks/Mocks.sol";
 
 contract LeashTest is Test {
+    using stdStorage for StdStorage;
+
     event PaymentBlocked(address indexed agent, address indexed to, uint256 amount, bytes32 reasonCode);
     event AgentAutoRevoked(address indexed agent, uint256 strikes);
     event IncidentReported(address indexed agent, uint256 indexed agentId, bool success);
@@ -210,6 +213,50 @@ contract LeashTest is Test {
         assertEq(leash.strikes(attacker), 1);
     }
 
+    function test_tryPayCallerCannotStrikeAnotherAgent() public {
+        vm.prank(attacker);
+        assertFalse(leash.tryPay(agent, merchant, U));
+        assertEq(leash.strikes(attacker), 1);
+        assertEq(leash.strikes(agent), 0);
+        assertTrue(_policyIsActive(agent));
+    }
+
+    function test_strangerCannotStrikeOrRevokeAnotherAgent() public {
+        vm.prank(attacker);
+        assertFalse(leash.tryPay(agent, merchant, U));
+        vm.prank(attacker);
+        assertFalse(leash.tryPay(agent, merchant, U));
+        vm.prank(attacker);
+        assertFalse(leash.tryPay(agent, merchant, U));
+
+        assertEq(leash.strikes(attacker), 3);
+        assertEq(leash.strikes(agent), 0);
+        assertTrue(_policyIsActive(agent));
+    }
+
+    function test_manyStrangersCannotGasGriefOrStrikeAgent() public {
+        for (uint256 i; i < 64; i++) {
+            address caller = makeAddr(string.concat("blocked-caller-", vm.toString(i)));
+            vm.prank(caller);
+            assertFalse(leash.tryPay(agent, merchant, U));
+            assertEq(leash.strikes(caller), 1);
+        }
+        assertEq(leash.strikes(agent), 0);
+        assertTrue(_policyIsActive(agent));
+    }
+
+    function test_agentCannotStrikeOrRevokePeer() public {
+        vm.prank(owner);
+        leash.setPolicy(stranger, _policy(10 * U, 25 * U, 5 * U, 0));
+
+        vm.prank(agent);
+        assertFalse(leash.tryPay(stranger, merchant, U));
+        assertEq(leash.strikes(agent), 1);
+        assertEq(leash.strikes(stranger), 0);
+        assertTrue(_policyIsActive(agent));
+        assertTrue(_policyIsActive(stranger));
+    }
+
     function test_tryPay_recordsBlockedEventWithReason_Paused() public {
         vm.prank(owner);
         leash.pause();
@@ -335,6 +382,90 @@ contract LeashTest is Test {
         assertEq(count, 1);
         assertEq(value, -100);
         assertEq(decimals, 0);
+    }
+
+    function test_maliciousRegistryCannotReenterTryPay() public {
+        (, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.startPrank(owner);
+        leash.setMaxStrikes(1);
+        leash.setAllowed(merchant, true);
+        leash.setPolicy(address(registry), _policy(10 * U, 25 * U, 5 * U, 0));
+        vm.stopPrank();
+        registry.setCallback(address(registry), merchant);
+
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        assertTrue(registry.callbackAttempted());
+        assertFalse(registry.callbackSucceeded());
+        assertEq(leash.strikes(agent), 1);
+        assertEq(leash.strikes(address(registry)), 0);
+        assertEq(usdg.balanceOf(merchant), 0);
+    }
+
+    function test_registryOwnerCallbackCannotReactivateAutoRevokedAgent() public {
+        MockIncidentIdentity identity = new MockIncidentIdentity();
+        identity.mint(77, agent);
+        MockIncidentRegistry registry = new MockIncidentRegistry(address(identity));
+        Leash registryOwnedLeash = new Leash(address(usdg), address(registry));
+
+        assertTrue(registry.execute(address(registryOwnedLeash), abi.encodeWithSelector(Leash.setFeedbackRegistry.selector, address(registry))));
+        assertTrue(registry.execute(address(registryOwnedLeash), abi.encodeWithSelector(Leash.setMaxStrikes.selector, 1)));
+        assertTrue(
+            registry.execute(
+                address(registryOwnedLeash),
+                abi.encodeWithSelector(Leash.setPolicy.selector, agent, _policy(10 * U, 25 * U, 5 * U, 0))
+            )
+        );
+        assertTrue(registry.execute(address(registryOwnedLeash), abi.encodeWithSelector(Leash.linkAgentId.selector, agent, 77)));
+
+        registry.setCallbackData(
+            address(registryOwnedLeash),
+            abi.encodeWithSelector(Leash.setPolicy.selector, agent, _policy(10 * U, 25 * U, 5 * U, 0))
+        );
+        vm.prank(agent);
+        assertFalse(registryOwnedLeash.tryPay(agent, stranger, U));
+
+        assertFalse(registry.callbackSucceeded());
+        (bool active,,,,,) = registryOwnedLeash.policies(agent);
+        assertFalse(active);
+    }
+
+    function test_staleAgentIdLinkFailsClosedAfterIdentityTransfer() public {
+        (MockIncidentIdentity identity, MockIncidentRegistry registry) = _incidentSetup(42);
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        identity.mint(42, stranger);
+        assertEq(identity.ownerOf(42), stranger);
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(registry.lastIndex(42, address(leash)), 0);
+        assertTrue(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertFalse(_policyIsActive(agent));
+    }
+
+    function test_agentLinkCannotBeReusedWithDifferentFeedbackRegistry() public {
+        (, MockIncidentRegistry originalRegistry) = _incidentSetup(42);
+        MockIncidentIdentity otherIdentity = new MockIncidentIdentity();
+        otherIdentity.mint(42, stranger);
+        MockIncidentRegistry replacementRegistry = new MockIncidentRegistry(address(otherIdentity));
+        vm.startPrank(owner);
+        leash.setFeedbackRegistry(address(replacementRegistry));
+        leash.setMaxStrikes(1);
+        vm.stopPrank();
+
+        vm.recordLogs();
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(originalRegistry.lastIndex(42, address(leash)), 0);
+        assertEq(replacementRegistry.lastIndex(42, address(leash)), 0);
+        assertTrue(_eventExists(logs, keccak256("IncidentReportFailed(address,uint256)")));
+        assertFalse(_policyIsActive(agent));
     }
 
     function test_incidentNotReportedWhenUnconfigured() public {
@@ -537,6 +668,36 @@ contract LeashTest is Test {
         vm.expectRevert(Leash.NotAgent.selector);
         leash.approve(id);
         vm.stopPrank();
+    }
+
+    function test_pendingApprovalAfterAutoRevokeCannotExecuteAndCanBeRejected() public {
+        vm.prank(agent);
+        uint256 id = leash.pay(merchant, 8 * U, "pending");
+        vm.prank(owner);
+        leash.setMaxStrikes(1);
+
+        vm.prank(agent);
+        assertFalse(leash.tryPay(agent, stranger, U));
+        (,,,,, Leash.Status status) = leash.requests(id);
+        assertEq(uint8(status), uint8(Leash.Status.Pending));
+
+        vm.prank(owner);
+        vm.expectRevert(Leash.NotAgent.selector);
+        leash.approve(id);
+        assertEq(usdg.balanceOf(merchant), 0);
+        (,,,,, status) = leash.requests(id);
+        assertEq(uint8(status), uint8(Leash.Status.Pending));
+
+        vm.prank(owner);
+        leash.reject(id);
+        (,,,,, status) = leash.requests(id);
+        assertEq(uint8(status), uint8(Leash.Status.Rejected));
+    }
+
+    function test_tryPayStrikeCounterDoesNotOverflow() public {
+        stdstore.target(address(leash)).sig("strikes(address)").with_key(agent).checked_write(type(uint256).max);
+        assertFalse(_expectBlocked(agent, agent, stranger, U, leash.REASON_NOT_ALLOWLISTED()));
+        assertEq(leash.strikes(agent), type(uint256).max);
     }
 
     function test_approval_expires() public {

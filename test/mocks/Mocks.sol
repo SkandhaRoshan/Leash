@@ -135,6 +135,12 @@ contract MockIncidentRegistry {
     bool public shouldRevert;
     bool public consumeGas;
     bool public policyActiveDuringCall;
+    bool public callbackAttempted;
+    bool public callbackSucceeded;
+    address public callbackAgent;
+    address public callbackTo;
+    address public callbackTarget;
+    bytes public callbackData;
     mapping(uint256 => mapping(address => uint64)) public lastIndex;
     mapping(uint256 => mapping(address => mapping(uint64 => Feedback))) private _feedback;
 
@@ -145,6 +151,20 @@ contract MockIncidentRegistry {
     function setBehavior(bool shouldRevert_, bool consumeGas_) external {
         shouldRevert = shouldRevert_;
         consumeGas = consumeGas_;
+    }
+
+    function setCallback(address agent, address to) external {
+        callbackAgent = agent;
+        callbackTo = to;
+    }
+
+    function setCallbackData(address target, bytes calldata data) external {
+        callbackTarget = target;
+        callbackData = data;
+    }
+
+    function execute(address target, bytes calldata data) external returns (bool success) {
+        (success,) = target.call(data);
     }
 
     function getIdentityRegistry() external view returns (address) {
@@ -166,6 +186,15 @@ contract MockIncidentRegistry {
         }
         require(!shouldRevert, "mock feedback failure");
         _storeFeedback(agentId, value, valueDecimals, tag1, tag2, feedbackHash);
+        if (callbackTarget != address(0)) {
+            callbackAttempted = true;
+            (callbackSucceeded,) = callbackTarget.call(callbackData);
+        } else if (callbackAgent != address(0)) {
+            callbackAttempted = true;
+            (callbackSucceeded,) = msg.sender.call(
+                abi.encodeWithSignature("tryPay(address,address,uint256)", callbackAgent, callbackTo, 1)
+            );
+        }
     }
 
     function _storeFeedback(
